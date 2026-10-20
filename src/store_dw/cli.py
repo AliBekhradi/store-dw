@@ -7,6 +7,7 @@ import psycopg
 
 from store_dw.config import ConfigError, load_settings
 from store_dw.db import check_connection
+from store_dw.source_ops import reset_source as do_reset_source, run_source_migrations
 
 
 def doctor() -> int:
@@ -29,7 +30,6 @@ def doctor() -> int:
                 timeout=settings.connect_timeout_seconds,
             )
         except psycopg.Error:
-            # Connection errors can contain sensitive connection details.
             print(
                 f"{name}: FAILED — check server, database, and credentials.",
                 file=sys.stderr,
@@ -41,6 +41,26 @@ def doctor() -> int:
     return 1 if failed else 0
 
 
+def migrate_source() -> int:
+    try:
+        run_source_migrations()
+        print("Source migrations applied successfully.")
+        return 0
+    except Exception as error:
+        print(f"Migration error: {error}", file=sys.stderr)
+        return 1
+
+
+def reset_source() -> int:
+    try:
+        do_reset_source()
+        print("Source database reset and schema recreated.")
+        return 0
+    except Exception as error:
+        print(f"Reset error: {error}", file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="store-dw",
@@ -49,13 +69,19 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
 
     commands.add_parser("doctor", help="Check configuration and databases.")
-    commands.add_parser("migrate", help="Apply migrations (not implemented yet).")
+    commands.add_parser("migrate-source", help="Apply source operational migrations.")
+    commands.add_parser("reset-source", help="Wipe and recreate source operational schema.")
+    commands.add_parser("migrate", help="Apply warehouse migrations (not implemented yet).")
     commands.add_parser("run", help="Run the pipeline (not implemented yet).")
 
     args = parser.parse_args(argv)
 
     if args.command == "doctor":
         return doctor()
+    if args.command == "migrate-source":
+        return migrate_source()
+    if args.command == "reset-source":
+        return reset_source()
 
     print(
         f"{args.command}: not implemented yet.",
@@ -65,4 +91,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
