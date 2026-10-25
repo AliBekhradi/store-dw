@@ -1,6 +1,25 @@
 # Source Data Contracts
 
-This document formalizes the interface agreements between operational source databases (OLTP) and downstream data pipelines (Raw Ingestion / ELT layer). Every entity ingested into the Data Warehouse must adhere to the guarantees specified below.
+This document defines the source interfaces for Project Undead version 1:
+
+- Customers, products, orders, and order items: PostgreSQL.
+- Payments: a simulated HTTP API.
+- Refunds: immutable CSV deliveries.
+
+Business meaning is defined in business_rules.md. Source field names,
+types, identifiers, and update behavior are defined here.
+
+All source monetary amounts are integer Iranian rial (IRR).
+Toman, fractional rial, other currencies, tax, and shipping are outside
+version 1. Monetary amounts must never pass through floating-point types.
+
+PostgreSQL timestamps use TIMESTAMPTZ. HTTP and CSV timestamps use ISO 8601
+with an explicit UTC designator or numeric offset. Processing windows use
+UTC; reporting dates use Asia/Tehran.
+
+Creation and update timestamps must not substitute for business event
+timestamps.
+
 
 ---
 
@@ -24,13 +43,15 @@ This document formalizes the interface agreements between operational source dat
 | `updated_at` | `TIMESTAMPTZ` | `TIMESTAMPTZ` | No | UTC, must satisfy `updated_at >= created_at` |
 
 ### Section C: Temporal & Mutation Contract
-* **Watermark / Ingestion Column:** `updated_at` (High-water mark column for CDC and incremental extraction)
-* **Mutation Behavior:** Slowly changing entity. Updates occur upon profile edits. Pipeline tracks changes via SCD Type 2 downstream (`dim_customers`).
-* **Late-Arriving Data Tolerance:** Incremental extraction must evaluate lookback intervals using:
-  `WHERE updated_at >= :last_checkpoint - INTERVAL '72 hours'`
+- Watermark: updated_at.
+- customer_id is stable and immutable.
+- Profile attributes may change.
+- Warehouse customer dimensions use Type 1 updates, not Type 2 history.
+- Source records are not hard-deleted in version 1.
+- Incremental extraction follows the shared extraction contract below.
 
 ### Section D: Failure & Rejection Policy
-* Records with null or negative `customer_id` are dropped at the ingestion barrier and routed to `audit.rejected_records` with reason code `ERR_NULL_PK`.
+- Missing or non-positive customer_id values are rejected with reason ERR_INVALID_PK.
 * Duplicate `customer_id` within the same extraction batch will fail pipeline validation.
 
 ---
@@ -50,19 +71,26 @@ This document formalizes the interface agreements between operational source dat
 | `sku` | `VARCHAR(64)` | `VARCHAR(64)` | No | Unique, alphanumeric code |
 | `product_name` | `VARCHAR(255)` | `VARCHAR(255)` | No | Catalog title |
 | `category` | `VARCHAR(100)` | `VARCHAR(100)` | No | Canonical product department / grouping |
-| `price_cents` | `INTEGER` | `INTEGER` | No | Stored in minor currency units (cents), must be $\ge 0$ |
+| `price_rial` | `BIGINT` | `BIGINT` | No | Integer rial, must be >= 0 |
 | `stock_quantity` | `INTEGER` | `INTEGER` | No | Must be $\ge 0$ |
 | `created_at` | `TIMESTAMPTZ` | `TIMESTAMPTZ` | No | UTC |
 | `updated_at` | `TIMESTAMPTZ` | `TIMESTAMPTZ` | No | UTC, must satisfy `updated_at >= created_at` |
 
 ### Section C: Temporal & Mutation Contract
-* **Watermark / Ingestion Column:** `updated_at`
-* **Mutation Behavior:** Mutable attributes include `product_name`, `category`, `price_cents`, and `stock_quantity`.
-* **Late-Arriving Data Tolerance:** Standard 72-hour sliding window.
+- Watermark: updated_at.
+- product_id and sku are stable and immutable.
+- Mutable attributes include product_name, category, price_rial,
+  and stock_quantity.
+- Warehouse product dimensions use Type 1 updates.
+- Current catalog prices do not determine historical order-line prices.
+- stock_quantity is a source snapshot; inventory movement simulation is
+  outside version 1.
+- Source records are not hard-deleted in version 1.
+- Incremental extraction follows the shared extraction contract below.
 
 ### Section D: Failure & Rejection Policy
 * Rows with missing `product_id` or `sku` are quarantined with reason `ERR_NULL_PK_OR_SKU`.
-* If `price_cents < 0` or `stock_quantity < 0`, the record is routed to `audit.rejected_records` with reason `ERR_NEGATIVE_VALUE`.
+* If `price_rial < 0` or `stock_quantity < 0`, the record is routed to `audit.rejected_records` with reason `ERR_NEGATIVE_VALUE`.
 
 ---
 
@@ -77,25 +105,35 @@ This document formalizes the interface agreements between operational source dat
 ### Section B: Schema & Type Definitions
 | Column Name | Source Operational Type | Target Raw Type | Nullable | Constraints / Allowed Values |
 | :--- | :--- | :--- | :--- | :--- |
-| `order_id` | `BIGINT` | `BIGINT` | No | Primary Key, unique sequential integer |
+| `order_id` | `BIGINT` | `BIGINT` | No | Primary key, strictly positive; sequence-generated, not gapless |
 | `customer_id` | `BIGINT` | `BIGINT` | No | Foreign Key references `customers(customer_id)` |
-| `order_status` | `VARCHAR(32)` | `VARCHAR(32)` | No | Allowed: `['PENDING','PAID','SHIPPED','CANCELLED','REFUNDED']` |
-| `subtotal_cents` | `INTEGER` | `INTEGER` | No | Must be $\ge 0$ |
-| `tax_cents` | `INTEGER` | `INTEGER` | No | Default 0, must be $\ge 0$ |
-| `shipping_cents` | `INTEGER` | `INTEGER` | No | Default 0, must be $\ge 0$ |
-| `total_cents` | `INTEGER` | `INTEGER` | No | Must equal `subtotal_cents + tax_cents + shipping_cents` |
+| `order_status` | `VARCHAR(32)` | `VARCHAR(32)` | No | pending, completed, cancelled |
 | `created_at` | `TIMESTAMPTZ` | `TIMESTAMPTZ` | No | UTC, order placement timestamp |
-| `updated_at` | `TIMESTAMPTZ` | `TIMESTAMPTZ` | No | UTC, state transition timestamp ($\ge \text{created\_at}$) |
+| `updated_at` | `TIMESTAMPTZ` | `TIMESTAMPTZ` | No | UTC, source mutation timestamp; >= created_at and, when present, completed_at |
+| `completed_at` | `TIMESTAMPTZ` | `TIMESTAMPTZ` | Yes | Required for completed orders; null otherwise; >= created_at |
 
 ### Section C: Temporal & Mutation Contract
-* **Watermark / Ingestion Column:** `updated_at`
-* **Mutation Behavior:** State transitions update `order_status` and financial totals. Ingestion operates as UPSERT on `order_id`.
-* **Late-Arriving Data Tolerance:** Lookback window of 7 days to capture delayed status transitions (e.g., shipment confirmation or terminal refunds).
+- Watermark: updated_at.
+- order_id, customer_id, and created_at are immutable.
+- New orders begin pending.
+- Allowed transitions are pending -> completed and pending -> cancelled.
+- completed and cancelled are terminal states.
+- completed_at is set when an order completes and is then immutable.
+- Completed orders require at least one order line.
+- Order lines are inserted while the order is pending.
+- Cancellation happens before completion; post-completion reversals use
+  refunds, not order status changes.
+- The completed order total is the sum of its line_sales_rial values.
+- Source records are not hard-deleted in version 1.
+- Incremental extraction follows the shared extraction contract below.
+
 
 ### Section D: Failure & Rejection Policy
-* Unknown status values trigger rejection with reason `ERR_INVALID_STATUS_ENUM`.
-* Records where `total_cents != (subtotal_cents + tax_cents + shipping_cents)` or any component amount $< 0$ are quarantined with `ERR_INVALID_TOTAL`.
-* Unmatched foreign keys to `customers` are allowed in staging but linked to surrogate fallback record ($key = -1$) in warehouse dimensions.
+- Unknown statuses are rejected with ERR_INVALID_STATUS_ENUM.
+- Invalid completion timestamp/status combinations are rejected with ERR_INVALID_COMPLETION.
+- A completed order without lines blocks publication.
+- Missing customer references are recoverable rejections. They must not become 
+published facts with fabricated customer references.
 
 ---
 
@@ -104,28 +142,37 @@ This document formalizes the interface agreements between operational source dat
 ### Section A: Identity & Key Semantics
 * **Entity Name:** `order_items`
 * **Natural / Business Key:** Composite of `(order_id, product_id)`
-* **Surrogate / Stable Ingestion Key:** `(order_id, order_item_id)`
+* **Surrogate / Stable Ingestion Key:** order_item_id, globally unique across all orders.
 * **Granularity:** One record per distinct product line within an order.
 
 ### Section B: Schema & Type Definitions
 | Column Name | Source Operational Type | Target Raw Type | Nullable | Constraints / Allowed Values |
 | :--- | :--- | :--- | :--- | :--- |
-| `order_item_id` | `BIGINT` | `BIGINT` | No | Line item ID, unique per order |
+| `order_item_id` | `BIGINT` | `BIGINT` | No | Globally unique, strictly positive primary key |
 | `order_id` | `BIGINT` | `BIGINT` | No | Foreign Key references `orders(order_id)` |
 | `product_id` | `BIGINT` | `BIGINT` | No | Foreign Key references `products(product_id)` |
 | `quantity` | `INTEGER` | `INTEGER` | No | Must be strictly $> 0$ |
-| `unit_price_cents` | `INTEGER` | `INTEGER` | No | Price per unit at purchase, must be $\ge 0$ |
-| `line_total_cents` | `INTEGER` | `INTEGER` | No | Must equal `quantity * unit_price_cents` |
+| `unit_price_rial` | `BIGINT` | `BIGINT` | No | Historical unit price in rial; >= 0 |
+| `line_discount_rial` | `BIGINT` | `BIGINT` | No | Whole-line discount in rial; >= 0 and <= quantity * unit_price_rial |
+| `line_sales_rial` | `BIGINT` | `BIGINT` | No | quantity * unit_price_rial - line_discount_rial |
 | `created_at` | `TIMESTAMPTZ` | `TIMESTAMPTZ` | No | UTC, immutable line item creation timestamp |
 
 ### Section C: Temporal & Mutation Contract
-* **Watermark / Ingestion Column:** `created_at`
-* **Mutation Behavior:** Immutable append-only log. Rows are never updated after creation.
-* **Late-Arriving Data Tolerance:** Inherits batch extraction window of parent `orders` entity.
+- Watermark: created_at.
+- Lines are immutable after insertion in version 1, including while the order is pending.
+Editing a pending basket is outside this simulator's scope.
+- Lines can only be inserted into pending orders.
+- created_at must be at or after the parent order's created_at.
+- Every line must exist before the order is completed.
+- Source records are not hard-deleted.
+- Incremental extraction follows the shared extraction contract below.
 
 ### Section D: Failure & Rejection Policy
-* Records where `order_id` does not exist in `orders` are logged to `audit.quality_results` as `ERR_ORPHAN_LINE_ITEM`.
-* Records where `quantity <= 0`, `unit_price_cents < 0`, or `line_total_cents != quantity * unit_price_cents` are rejected with `ERR_INVALID_LINE_ITEM`.
+- Missing order or product references are recoverable rejections.
+- Non-positive quantities, negative prices, invalid discounts, or incorrect
+  line_sales_rial values are rejected with ERR_INVALID_LINE_ITEM.
+- Amount arithmetic must remain within PostgreSQL BIGINT range.
+
 
 ---
 
@@ -138,26 +185,40 @@ This document formalizes the interface agreements between operational source dat
 * **Granularity:** One record per payment attempt or transaction.
 
 ### Section B: Schema & Type Definitions
-| Column Name | Source Operational Type | Target Raw Type | Nullable | Constraints / Allowed Values |
+| Column Name | HTTP JSON Type | Normalized Type | Nullable | Constraints / Allowed Values |
 | :--- | :--- | :--- | :--- | :--- |
-| `payment_id` | `BIGINT` | `BIGINT` | No | Primary Key |
-| `order_id` | `BIGINT` | `BIGINT` | No | Foreign Key references `orders(order_id)` |
-| `payment_method` | `VARCHAR(50)` | `VARCHAR(50)` | No | Operational payment method label |
-| `payment_status` | `VARCHAR(32)` | `VARCHAR(32)` | No | Allowed: `['PENDING','SUCCESS','FAILED']` |
-| `amount_cents` | `INTEGER` | `INTEGER` | No | Must be strictly $> 0$ |
-| `currency` | `CHAR(3)` | `CHAR(3)` | No | Default `'USD'`, 3-letter ISO currency code |
-| `created_at` | `TIMESTAMPTZ` | `TIMESTAMPTZ` | No | UTC, attempt initialization timestamp |
-| `updated_at` | `TIMESTAMPTZ` | `TIMESTAMPTZ` | No | UTC, terminal state timestamp ($\ge \text{created\_at}$) |
+| `payment_id` | `integer` | `BIGINT` | No | Positive, stable payment identifier |
+| `order_id` | `integer` | `BIGINT` | No | Positive logical reference to store orders(order_id) |
+| `payment_method` | `string` | `TEXT` | No | Operational payment method label |
+| `payment_status` | `string` | `TEXT` | No | pending, succeeded, failed |
+| `amount_rial` | `integer` | `BIGINT` | No | Strictly positive integer rial |
+| `created_at` | `string` | `TIMESTAMPTZ` | No | ISO 8601 with explicit offset; attempt initialization timestamp |
+| `updated_at` | `string` | `TIMESTAMPTZ` | No | ISO 8601 with explicit offset; source mutation timestamp; >= created_at and, when present, succeeded_at |
+| `succeeded_at` | `string` | `TIMESTAMPTZ` | Yes | ISO 8601 with explicit offset; payment-success event timestamp; required for succeeded, null otherwise; >= created_at and <= updated_at |
 
 ### Section C: Temporal & Mutation Contract
-* **Watermark / Ingestion Column:** `updated_at`
-* **Mutation Behavior:** Transitions from `PENDING` $\to$ `SUCCESS` or `FAILED`.
-* **Late-Arriving Data Tolerance:** 24–48 hours for external gateway webhook reconciliations.
+- Delivery interface: HTTP only. The warehouse extractor cannot read the
+  simulator's private database directly.
+- Watermark: updated_at.
+- payment_id, order_id, amount_rial, payment_method, and created_at are immutable.
+- Allowed transitions: pending -> succeeded and pending -> failed.
+- succeeded and failed are terminal states.
+- succeeded_at is set on success and is then immutable.
+- A retry after failure creates a new payment_id.
+- A payment may first be observed in any allowed state.
+- Payment success and order completion are independent events.
+- Source records are not hard-deleted.
+- Incremental extraction follows the shared extraction contract below.
 
 ### Section D: Failure & Rejection Policy
-* Missing relational keys (`payment_id`, `order_id`) generate `ERR_NULL_RELATIONAL_KEYS`.
-* Non-positive `amount_cents` values are rejected with `ERR_NON_POSITIVE_PAYMENT`.
-* Unrecognized status triggers `ERR_INVALID_STATUS_ENUM`.
+- Missing or non-positive payment_id or order_id values are rejected with
+  ERR_NULL_RELATIONAL_KEYS.
+- Non-positive amount_rial values are rejected with ERR_NON_POSITIVE_PAYMENT.
+- Unknown payment statuses are rejected with ERR_INVALID_STATUS_ENUM.
+- Invalid success timestamp/status combinations are rejected.
+- Missing order references remain recoverable.
+- A successful payment for an existing pending or cancelled order is not
+  rejected merely because the order is not completed.
 
 ---
 
@@ -167,25 +228,66 @@ This document formalizes the interface agreements between operational source dat
 * **Entity Name:** `refunds`
 * **Natural / Business Key:** `refund_id`
 * **Surrogate / Stable Ingestion Key:** `refund_id` (`BIGINT`)
-* **Granularity:** One record per refund request / line reversal.
+* **Granularity:** One immutable completed monetary refund against one order line.
 
 ### Section B: Schema & Type Definitions
-| Column Name | Source Operational Type | Target Raw Type | Nullable | Constraints / Allowed Values |
-| :--- | :--- | :--- | :--- | :--- |
-| `refund_id` | `BIGINT` | `BIGINT` | No | Primary Key |
-| `order_id` | `BIGINT` | `BIGINT` | No | Foreign Key references `orders(order_id)` |
-| `payment_id` | `BIGINT` | `BIGINT` | No | Foreign Key references `payments(payment_id)` |
-| `amount_cents` | `INTEGER` | `INTEGER` | No | Must be strictly $> 0$ |
-| `refund_status` | `VARCHAR(32)` | `VARCHAR(32)` | No | Allowed: `['PENDING','COMPLETED','FAILED']` |
-| `reason` | `VARCHAR(255)` | `VARCHAR(255)` | Yes | Operational justification text |
-| `created_at` | `TIMESTAMPTZ` | `TIMESTAMPTZ` | No | UTC, refund request timestamp |
-| `updated_at` | `TIMESTAMPTZ` | `TIMESTAMPTZ` | No | UTC, settlement timestamp ($\ge \text{created\_at}$) |
+| Column | CSV representation | Normalized type | Required | Rules |
+| --- | --- | --- | --- | --- |
+| refund_id | Base-10 integer text | BIGINT | Yes | Positive, stable refund identifier |
+| order_item_id | Base-10 integer text | BIGINT | Yes | References one globally identified order line |
+| amount_rial | Base-10 integer text | BIGINT | Yes | Strictly positive integer rial |
+| refunded_at | ISO 8601 timestamp with offset | TIMESTAMPTZ | Yes | Completed-refund event timestamp |
+| reason | Text | TEXT | No | Optional explanation |
 
-### Section C: Temporal & Mutation Contract
-* **Watermark / Ingestion Column:** `updated_at`
-* **Mutation Behavior:** State moves from `PENDING` to terminal states (`COMPLETED` or `FAILED`).
-* **Late-Arriving Data Tolerance:** Up to 30 days due to chargeback windows and disputed claims.
+### Section C: Delivery & Mutation Contract
+
+- Delivery interface: UTF-8, comma-separated CSV with a header.
+- Header: refund_id,order_item_id,amount_rial,refunded_at,reason
+- Every row represents a completed refund.
+- Records are immutable; corrections and reversals are outside version 1.
+- Files are identified by content hash, not filename alone.
+- refund_id deduplicates business refunds across different files.
+- An identical repeated refund is not a new refund.
+- No timestamp checkpoint is used to discover files.
 
 ### Section D: Failure & Rejection Policy
-* Any refund with `amount_cents <= 0` is rejected with `ERR_NON_POSITIVE_REFUND`.
-* Total aggregated `amount_cents` per `order_id` exceeding the parent order's `total_cents` raises a business integrity alert (`ERR_INVALID_REFUND_AMOUNT`).
+
+- Malformed rows are quarantined with file identity, row number, original
+  values, and rejection reason. Valid rows may proceed.
+- Missing order-line references remain recoverable through revalidation.
+- Refunds must reference completed orders.
+- refunded_at must be at or after the referenced order's completed_at.
+- Refund amounts must be positive.
+- A zero-value line cannot receive a monetary refund.
+- Cumulative distinct refunds against a line cannot exceed line_sales_rial.
+- Individually valid refunds that collectively exceed the line limit block
+  publication; arrival order must not determine which refunds survive.
+- Conflicting business fields for the same refund_id block publication.
+
+---
+
+## 7. Shared Incremental Extraction Contract
+
+Applies to customers, products, orders, order_items, and payments.
+
+- Mutable records use updated_at; immutable order items use created_at.
+- created_at is immutable for all entities covered by this section.
+- Inserts explicitly set their timestamps. Mutable records initially have
+  updated_at >= created_at.
+- Every subsequent mutation updates updated_at using the source clock.
+- Extraction uses a fixed, exclusive upper bound for the run:
+  [previous_checkpoint - overlap, run_upper_bound).
+- Default overlap: 48 hours, configurable.
+- PostgreSQL extraction uses a consistent read snapshot.
+- Rows are ordered by (watermark, stable_id).
+- HTTP pagination must provide a stable result set for the requested window,
+  using a snapshot-bound cursor or equivalent behavior.
+- The same window may be extracted repeatedly.
+- Older replayed records must not overwrite newer warehouse state.
+- Equal identity and update timestamp with conflicting payloads must be
+  surfaced as a conflict, not resolved by arbitrary arrival order.
+- An overlap is not a guarantee against arbitrarily late visibility.
+  Records becoming visible outside the overlap require a wider replay.
+- No hard deletes are supported in version 1.
+- Initial seeding is followed by a full extraction. Incremental guarantees
+  apply to subsequent source activity, not backdated development reseeding.
