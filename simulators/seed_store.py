@@ -1,8 +1,25 @@
-from datetime import datetime, timedelta, timezone
 import os
+import sys
+from datetime import UTC, datetime, timedelta
 from getpass import getpass
 
 import psycopg
+from psycopg.conninfo import conninfo_to_dict
+
+from store_dw.config import load_source_dsn
+
+
+def source_connection_kwargs():
+    """Use the application's DSN name, preserving the original simulator alias."""
+    env = dict(os.environ)
+    if "STORE_DW_SOURCE_DSN" not in env and "STORE_DATABASE_DSN" in env:
+        env["STORE_DW_SOURCE_DSN"] = env["STORE_DATABASE_DSN"]
+        print("STORE_DATABASE_DSN is a legacy alias; prefer STORE_DW_SOURCE_DSN.", file=sys.stderr)
+    dsn = load_source_dsn(env)
+    kwargs = {"conninfo": dsn}
+    if not conninfo_to_dict(dsn).get("password") and not env.get("PGPASSWORD"):
+        kwargs["password"] = getpass("PostgreSQL password: ")
+    return kwargs
 
 def build_customers():
     return [
@@ -46,7 +63,7 @@ def build_products():
     ]
 
 def build_orders():
-    placed_at = datetime(2025, 1, 15, 10, 0, tzinfo=timezone.utc)
+    placed_at = datetime(2025, 1, 15, 10, 0, tzinfo=UTC)
     line_created_at = placed_at + timedelta(minutes=1)
     completed_at = placed_at + timedelta(minutes=5)
 
@@ -306,10 +323,7 @@ def main():
 
     check_order_scenarios(orders)
 
-    dsn = os.environ["STORE_DATABASE_DSN"]
-    password = getpass("PostgreSQL password: ")
-
-    with psycopg.connect(dsn, password=password) as conn:
+    with psycopg.connect(**source_connection_kwargs()) as conn:
         order_ids, item_ids = insert_store_records(
             conn, customers, products, orders
         )

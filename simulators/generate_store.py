@@ -1,12 +1,11 @@
 import argparse
-import random
-from datetime import datetime, timedelta, timezone
-import os
-from getpass import getpass
-import psycopg
 import hashlib
 import json
-from seed_store import insert_store_records
+import random
+from datetime import UTC, datetime, timedelta
+
+import psycopg
+from seed_store import insert_store_records, source_connection_kwargs
 
 
 def positive_int(value):
@@ -70,7 +69,7 @@ def generate_orders(count, batch, customers, products, rng):
     if not customers or not products:
         raise ValueError("Generating orders requires customers and products")
 
-    start = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    start = datetime(2025, 1, 1, tzinfo=UTC)
     orders = []
 
     for index in range(1, count + 1):
@@ -234,10 +233,7 @@ def main():
         print("Preview only — no database writes")
         return
 
-    dsn = os.environ["STORE_DATABASE_DSN"]
-    password = getpass("PostgreSQL password: ")
-
-    with psycopg.connect(dsn, password=password) as conn:
+    with psycopg.connect(**source_connection_kwargs()) as conn:
         order_ids, item_ids = insert_store_records(
             conn, customers, products, orders
         )

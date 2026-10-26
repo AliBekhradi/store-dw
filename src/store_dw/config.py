@@ -39,6 +39,11 @@ def _read_dsn(env: Mapping[str, str], name: str) -> str:
     return value
 
 
+def load_source_dsn(env: Mapping[str, str] | None = None) -> str:
+    """Validate source configuration for tools that do not need the warehouse."""
+    return _read_dsn(os.environ if env is None else env, "STORE_DW_SOURCE_DSN")
+
+
 def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     """Read settings, optionally from an injected mapping for tests."""
     if env is None:

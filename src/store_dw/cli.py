@@ -7,7 +7,8 @@ import psycopg
 
 from store_dw.config import ConfigError, load_settings
 from store_dw.db import check_connection
-from store_dw.source_ops import reset_source as do_reset_source, run_source_migrations
+from store_dw.source_ops import RESET_CONFIRMATION, SourceMigrationError, run_source_migrations
+from store_dw.source_ops import reset_source as do_reset_source
 
 
 def doctor() -> int:
@@ -46,18 +47,30 @@ def migrate_source() -> int:
         run_source_migrations()
         print("Source migrations applied successfully.")
         return 0
-    except Exception as error:
+    except (ConfigError, SourceMigrationError) as error:
         print(f"Migration error: {error}", file=sys.stderr)
+        return 1
+    except psycopg.Error:
+        print(
+            "Migration failed; changes rolled back. Check database access and SQL.", file=sys.stderr
+        )
         return 1
 
 
 def reset_source() -> int:
     try:
-        do_reset_source()
+        confirmation = input(f"This destroys the development source. Type {RESET_CONFIRMATION}: ")
+        do_reset_source(confirmation=confirmation)
         print("Source database reset and schema recreated.")
         return 0
-    except Exception as error:
+    except (ConfigError, SourceMigrationError) as error:
         print(f"Reset error: {error}", file=sys.stderr)
+        return 1
+    except (EOFError, KeyboardInterrupt):
+        print("Reset cancelled.", file=sys.stderr)
+        return 1
+    except psycopg.Error:
+        print("Reset failed; changes rolled back. Check database access and SQL.", file=sys.stderr)
         return 1
 
 

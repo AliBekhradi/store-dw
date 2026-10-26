@@ -12,7 +12,8 @@
 -- Run as the database owner (or a superuser): initialization also sets the
 -- current database's default time zone to UTC for subsequent connections.
 
-BEGIN;
+-- Transaction ownership belongs to the migration runner (or psql --single-transaction).
+-- Do not COMMIT here: the runner records this migration in the same transaction.
 SET LOCAL TIME ZONE 'UTC';
 
 -- SET LOCAL alone affects only this migration transaction. Persist the default
@@ -374,5 +375,3 @@ EXECUTE FUNCTION store_source.fn_reject_source_deletion();
 -- Initial seed updates invoke the real-time updated_at trigger.
 -- Deterministic seed business data excludes these operational update
 -- timestamps; use a full extraction after development reseeding.
-
-COMMIT;

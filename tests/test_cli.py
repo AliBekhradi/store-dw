@@ -69,3 +69,26 @@ def test_doctor_checks_warehouse_after_source_failure(monkeypatch, capsys, setti
 def test_unimplemented_commands_fail_explicitly(command, capsys):
     assert cli.main([command]) == 2
     assert "not implemented yet" in capsys.readouterr().err
+
+def test_reset_cli_passes_typed_confirmation(monkeypatch):
+    reset = Mock()
+    monkeypatch.setattr("builtins.input", lambda _: cli.RESET_CONFIRMATION)
+    monkeypatch.setattr(cli, "do_reset_source", reset)
+    assert cli.main(["reset-source"]) == 0
+    reset.assert_called_once_with(confirmation=cli.RESET_CONFIRMATION)
+
+
+def test_reset_cli_cancels_on_eof(monkeypatch):
+    monkeypatch.setattr("builtins.input", Mock(side_effect=EOFError))
+    reset = Mock()
+    monkeypatch.setattr(cli, "do_reset_source", reset)
+    assert cli.main(["reset-source"]) == 1
+    reset.assert_not_called()
+
+
+def test_migration_database_errors_do_not_expose_credentials(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli, "run_source_migrations", Mock(side_effect=psycopg.OperationalError("secret-password"))
+    )
+    assert cli.main(["migrate-source"]) == 1
+    assert "secret-password" not in capsys.readouterr().err
